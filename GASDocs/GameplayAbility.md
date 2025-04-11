@@ -32,6 +32,8 @@
 
 ### 添加 GE 的流程
 
+流程图在 [GE的添加流程](./GE的添加流程.drawio)
+
 以 `BlueprintCallable` 的 `BP_ApplyGameplayEffectToSelf` 作为入口
 
 1. 通过传入的 `TSubclassOf<UGameplayEffect>` 创建 GE 对象
@@ -125,3 +127,99 @@ if (bSetPeriod && Owner && (AppliedEffectSpec.GetPeriod() > UGameplayEffect::NO_
     TimerManager.SetTimer(AppliedActiveGE->PeriodHandle, Delegate, AppliedEffectSpec.GetPeriod(), true);
 }
 ```
+
+在 `InternalOnActiveGameplayEffectAdded` 函数中
+
+1. 会根据 GEComponent 来判断当前 GE 能否**被激活**或者说是否**被抑制**(`bIsInhibited`)
+2. 调用 `UAbilitySystemComponent::InhibitActiveGameplayEffect`
+
+
+在 `UAbilitySystemComponent::InhibitActiveGameplayEffect` 函数中
+
+1. 根据 GE 是否被 **抑制**
+   - 被抑制：执行 `RemoveActiveGameplayEffectGrantedTagsAndModifiers`
+   - 不被抑制：执行 `AddActiveGameplayEffectGrantedTagsAndModifiers`
+2. 触发 `OnInhibitionChanged` 事件
+3. 在 `FScopedAggregatorOnDirtyBatch` 对象析构的时候触发
+   - `ActiveGameplayEffects.OnMagnitudeDependencyChange` 属性变化事件
+   - `OnDirty` 脏数据事件触发
+
+
+
+### 执行 GE 的流程
+
+```cpp
+FTimerDelegate Delegate = FTimerDelegate::CreateUObject(Owner, &UAbilitySystemComponent::ExecutePeriodicEffect, AppliedActiveGE->Handle);
+```
+
+根据上面的代码，直接定位执行位置是 `UAbilitySystemComponent::ExecutePeriodicEffect`
+
+通过函数调用，真正执行的代码在 `FActiveGameplayEffectsContainer::ExecuteActiveEffectsFrom` 函数中
+
+1. 设置 `TargetTags` 即 Owner 标记上的 GameplayTags
+2. 计算 GE 的 Modifiers
+3. 通过循环调用 `InternalExecuteMod` 应用 `Modifier`
+4. 遍历 `Executions` 数组，计算得到 `ConditionalEffectSpecs` 将要附加的 GE
+5. 触发 GC
+6. 应用 `ConditionalEffectSpecs`
+7. 最后触发事件
+
+重点在于两个函数 `CalculateModifierMagnitudes` 和 `InternalExecuteMod`
+
+在 `CalculateModifierMagnitudes` 中
+
+```cpp
+const FGameplayModifierInfo& ModDef = Def->Modifiers[ModIdx];
+FModifierSpec& ModSpec = Modifiers[ModIdx];
+
+if (ModDef.ModifierMagnitude.AttemptCalculateMagnitude(*this, ModSpec.EvaluatedMagnitude) == false)
+{
+    ModSpec.EvaluatedMagnitude = 0.f;
+    ABILITY_LOG(Warning, TEXT("Modifier on spec: %s was asked to CalculateMagnitude and failed, falling back to 0."), *ToSimpleString());
+}
+```
+
+很清晰，通过在 GE 中配置的 `Def->Modifiers` 计算出 `ModSpec.EvaluatedMagnitude` 的值
+
+```cpp
+switch (MagnitudeCalculationType)
+{
+case EGameplayEffectMagnitudeCalculation::ScalableFloat:break;
+case EGameplayEffectMagnitudeCalculation::AttributeBased:break;
+case EGameplayEffectMagnitudeCalculation::CustomCalculationClass:break;
+case EGameplayEffectMagnitudeCalculation::SetByCaller:break;
+// ...
+}
+```
+
+在 `AttemptCalculateMagnitude` 中通过枚举，来计算具体的值内容
+
+
+在 `InternalExecuteMod` 函数中，核心代码如下
+
+```cpp
+if (AttributeSet->PreGameplayEffectExecute(ExecuteData))
+{
+    float OldValueOfProperty = Owner->GetNumericAttribute(ModEvalData.Attribute);
+    ApplyModToAttribute(ModEvalData.Attribute, ModEvalData.ModifierOp, ModEvalData.Magnitude, &ExecuteData);
+
+    FGameplayEffectModifiedAttribute* ModifiedAttribute = Spec.GetModifiedAttribute(ModEvalData.Attribute);
+    if (!ModifiedAttribute)
+    {
+        // If we haven't already created a modified attribute holder, create it
+        ModifiedAttribute = Spec.AddModifiedAttribute(ModEvalData.Attribute);
+    }
+    ModifiedAttribute->TotalMagnitude += ModEvalData.Magnitude;
+
+    {
+        SCOPE_CYCLE_COUNTER(STAT_PostGameplayEffectExecute);
+        /** This should apply 'gamewide' rules. Such as clamping Health to MaxHealth or granting +3 health for every point of strength, etc */
+        AttributeSet->PostGameplayEffectExecute(ExecuteData);
+    }
+}
+```
+
+基本流程也很简单
+
+1. 调用 `PreGameplayEffectExecute` 判断能否触发
+2. 
